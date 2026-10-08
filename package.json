@@ -1,0 +1,44 @@
+{
+  "name": "linkedin-jobs-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for LinkedIn job search. No login, no API keys, no dependencies, one file.",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "linkedin-jobs-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "llm",
+    "claude",
+    "opencode",
+    "linkedin",
+    "jobs",
+    "job-search",
+    "recruiting",
+    "api"
+  ],
+  "author": "Esteban Alonzo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EAlonzoCode/linkedin-jobs-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EAlonzoCode/linkedin-jobs-mcp/issues"
+  },
+  "homepage": "https://github.com/EAlonzoCode/linkedin-jobs-mcp#readme"
+}
