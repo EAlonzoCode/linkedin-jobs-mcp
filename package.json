@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test"
+    "test": "node --test test/protocol.test.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -40,7 +40,7 @@ async function politeFetch(url) {
 
   if (!res.ok) {
     const err = new Error(
-      `LinkedIn respondió ${res.status} para ${url.replace(/^https?:\/\/[^/]+/, '')}`
+      `LinkedIn responded with ${res.status} for ${url.replace(/^https?:\/\/[^/]+/, '')}`
     )
     err.status = res.status
     throw err
@@ -159,7 +159,7 @@ async function searchJobs({ keywords, location = '', page = 0, start, limit = 25
  */
 async function getJobDetails({ jobId }) {
   const id = extractJobId(jobId)
-  if (!id) throw new Error(`No pude extraer un id de empleo de "${jobId}"`)
+  if (!id) throw new Error(`Could not extract a job id from "${jobId}"`)
 
   const html = await politeFetch(`https://www.linkedin.com/jobs/view/${id}`)
 
@@ -198,7 +198,7 @@ async function getJobDetails({ jobId }) {
   if (/Solicitud sencilla|Easy Apply/i.test(html)) job.easyApply = true
 
   if (!job.title && !job.description) {
-    throw new Error(`El empleo ${id} ya no está publicado o es privado.`)
+    throw new Error(`Job ${id} is no longer posted, or it is private.`)
   }
 
   return job
@@ -212,28 +212,30 @@ const TOOLS = [
   {
     name: 'search-jobs',
     description:
-      'Busca ofertas de empleo en LinkedIn usando los endpoints públicos (sin login, sin riesgo para la cuenta). ' +
-      'Devuelve id, título, empresa, ubicación, fecha de publicación y enlace. ' +
-      'Usa `start` para paginar (cada página trae 25 resultados). ' +
-      'Para ver la descripción completa de una oferta llama después a `get-job-details`.',
+      'Search LinkedIn job postings via the public guest endpoints (no login, your account is never involved). ' +
+      'Returns id, title, company, location, posting date and URL. ' +
+      'Use `start` to paginate (each page returns up to 25 results). ' +
+      'For the full description of a posting, call `get-job-details` afterwards.',
     inputSchema: {
       type: 'object',
       properties: {
         keywords: {
           type: 'string',
-          description: 'Palabras clave del puesto, p. ej. "Data Analyst" o "analista de datos junior"'
+          description:
+            'Job keywords, e.g. "Data Analyst" or "junior data analyst" or "analista de datos junior"'
         },
         location: {
           type: 'string',
-          description: 'Ciudad o región, p. ej. "Madrid, España". Opcional; se puede dejar vacío.'
+          description:
+            'City or region, e.g. "Santiago, Chile". Optional; leave empty for any location.'
         },
         start: {
           type: 'number',
-          description: 'Desplazamiento para paginar (0, 25, 50...). Por defecto 0.'
+          description: 'Pagination offset (0, 25, 50, ...). Defaults to 0.'
         },
         limit: {
           type: 'number',
-          description: 'Máximo de resultados a devolver (1-50). Por defecto 25.'
+          description: 'Maximum results to return (1-50). Defaults to 25.'
         }
       },
       required: ['keywords']
@@ -242,16 +244,17 @@ const TOOLS = [
   {
     name: 'get-job-details',
     description:
-      'Devuelve la descripción completa, criterios de contratación (nivel, tipo de contrato, horario), ' +
-      'número de solicitudes y si admite "Solicitud sencilla" para una oferta concreta. ' +
-      'Acepta la URL completa o el id numérico que devuelve `search-jobs`. ' +
-      'Es la herramienta que hay que usar para comparar una oferta contra un CV.',
+      'Full description of a single job posting, including hiring criteria (seniority, employment type, ' +
+      'schedule, sectors), applicant count and whether it offers Easy Apply. ' +
+      'Accepts either the full job URL or the numeric id returned by `search-jobs`. ' +
+      'Use this to compare a posting against a CV or a set of requirements.',
     inputSchema: {
       type: 'object',
       properties: {
         jobId: {
           type: 'string',
-          description: 'URL de la oferta (https://www.linkedin.com/jobs/view/...) o id numérico.'
+          description:
+            'Job posting URL (https://www.linkedin.com/jobs/view/...) or numeric id.'
         }
       },
       required: ['jobId']
@@ -279,7 +282,7 @@ function replyError(id, code, message) {
 
 async function callTool(name, args) {
   if (name === 'search-jobs') {
-    if (!args?.keywords?.trim()) throw new Error('`keywords` es obligatorio.')
+    if (!args?.keywords?.trim()) throw new Error('`keywords` is required.')
     const jobs = await searchJobs({
       keywords: args.keywords.trim(),
       location: (args.location ?? '').trim(),
@@ -291,11 +294,11 @@ async function callTool(name, args) {
   }
 
   if (name === 'get-job-details') {
-    if (!args?.jobId) throw new Error('`jobId` es obligatorio.')
+    if (!args?.jobId) throw new Error('`jobId` is required.')
     return await getJobDetails({ jobId: String(args.jobId).trim() })
   }
 
-  throw new Error(`Herramienta desconocida: ${name}`)
+  throw new Error(`Unknown tool: ${name}`)
 }
 
 async function handle(line) {
@@ -303,7 +306,7 @@ async function handle(line) {
   try {
     msg = JSON.parse(line)
   } catch {
-    log(`entrada no-JSON descartada: ${line.slice(0, 120)}`)
+    log(`discarded non-JSON input: ${line.slice(0, 120)}`)
     return
   }
 
@@ -344,7 +347,7 @@ async function handle(line) {
       })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      log(`tools/call ${name} falló: ${message}`)
+      log(`tools/call ${name} failed: ${message}`)
       reply(id, {
         isError: true,
         content: [{ type: 'text', text: `Error: ${message}` }]
@@ -359,7 +362,7 @@ async function handle(line) {
     return
   }
 
-  replyError(id, -32601, `Método no soportado: ${method}`)
+  replyError(id, -32601, `Unsupported method: ${method}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -384,4 +387,4 @@ process.on('uncaughtException', (err) => {
   log(`uncaught: ${err?.stack ?? err}`)
 })
 
-log(`linkedin-jobs MCP listo (pid=${process.pid})`)
+log(`linkedin-jobs MCP ready (pid=${process.pid})`)

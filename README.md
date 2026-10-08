@@ -1,5 +1,10 @@
 # LinkedIn Jobs MCP
 
+[![CI](https://github.com/EAlonzoCode/linkedin-jobs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/EAlonzoCode/linkedin-jobs-mcp/actions/workflows/ci.yml)
+[![Node ≥ 18](https://img.shields.io/badge/node-%E2%89%A5%2018-339933)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#why-this-one)
+
 > MCP server for LinkedIn job search. **No login, no API keys, no dependencies, one file.**
 
 Talk to any MCP-compatible client (OpenCode, Claude Desktop, Claude Code, …) and search
@@ -22,7 +27,7 @@ all without touching your LinkedIn account.
 | Headless browser | ✅ Playwright/Chromium | ❌ | ❌ **none** |
 | Dependencies | dozens | SDK + tokens | **0** |
 | Files | `node_modules/` | `node_modules/` | **1 file** |
-| Job search endpoint | scraping | ❌ **doesn't exist** | ✅ |
+| Job search source | scrapes your logged-in browser DOM | ❌ **doesn't exist** | public logged-out pages |
 | Risk to your account | ⚠️ automates your session | none | **none — your account is never involved** |
 
 LinkedIn's official API has **no job search endpoint for third parties**. That's the whole
@@ -100,7 +105,7 @@ relative path will fail silently with `Connection closed`.
       "company": "BC Tecnología",
       "location": "Gran Santiago, Región Metropolitana de Santiago, Chile",
       "postedAt": "2026-09-28",
-      "url": "https://es.linkedin.com/jobs/view/...-4471579965"
+      "url": "https://es.linkedin.com/jobs/view/-4471579965"
     }
   ]
 }
@@ -185,8 +190,10 @@ Read this before using it.
 ```bash
 npm test                 # protocol smoke test, offline, no network
 npm start                # run the server on stdio (Ctrl-C to stop)
-LOG_LEVEL=debug npm start
 ```
+
+`npm test` never touches the network, so CI runs the same suite on Node 18, 20, 22 and 24
+without any install step.
 
 Adding a tool = add an entry to the `TOOLS` array + a branch in `callTool()`. The transport
 does the rest.
