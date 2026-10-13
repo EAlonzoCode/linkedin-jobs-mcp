@@ -1,272 +1,250 @@
 #!/usr/bin/env node
 /**
- * LinkedIn Jobs MCP Server
+ * Multi-source job search MCP server.
  *
- * Searches public LinkedIn job postings through LinkedIn's *guest* endpoints —
- * the same HTML the logged-out Jobs page returns. No OAuth, no cookies, no
- * session: your LinkedIn account is never involved, so there is no account
- * risk. It also means no `send-message`, `connect`, or feed tools: those
- * genuinely require a logged-in session.
+ * Talks MCP over stdio (newline-delimited JSON-RPC) with no SDK. Sources live
+ * in `sources/`, one file per job board, and register themselves in
+ * `core/registry.js`; this file only wires the transport to that registry.
  *
- * stdout carries ONLY JSON-RPC (MCP stdio transport); diagnostics go to stderr.
+ * stdout carries ONLY JSON-RPC. Diagnostics go to stderr, because a log line
+ * on stdout corrupts the stream and clients disconnect with "Connection closed".
  */
 
-// ---------------------------------------------------------------------------
-// HTTP
-// ---------------------------------------------------------------------------
+import { SOURCES, getSource, searchableSources } from './core/registry.js'
+import { mapLimit } from './core/http.js'
+import { dedupe } from './core/dedupe.js'
+import { log } from './core/log.js'
 
-const HEADERS = {
-  'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-}
+const SERVER_INFO = { name: 'linkedin-jobs', version: '2.0.0' }
 
-/** Minimum gap between requests — the guest endpoints are IP rate-limited. */
-const MIN_GAP_MS = 600
-let lastRequestAt = 0
-
-function log(...args) {
-  process.stderr.write(`[${new Date().toISOString()}] ${args.join(' ')}\n`)
-}
-
-async function politeFetch(url) {
-  const wait = lastRequestAt + MIN_GAP_MS - Date.now()
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait))
-  lastRequestAt = Date.now()
-
-  const res = await fetch(url, { headers: HEADERS })
-  const body = await res.text()
-
-  if (!res.ok) {
-    const err = new Error(
-      `LinkedIn responded with ${res.status} for ${url.replace(/^https?:\/\/[^/]+/, '')}`
-    )
-    err.status = res.status
-    throw err
-  }
-  return body
-}
-
-// ---------------------------------------------------------------------------
-// HTML helpers (no parser dependency — the guest markup is stable and flat)
-// ---------------------------------------------------------------------------
-
-function decodeEntities(s) {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-}
-
-/** Strips tags, collapses whitespace, decodes entities. */
-function text(html) {
-  if (!html) return ''
-  return decodeEntities(
-    html
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/(p|li|div|h[1-6])>/gi, '\n')
-      .replace(/<[^>]+>/g, '')
-  )
-    .replace(/[ \t]+/g, ' ')
-    .replace(/ *\n */g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-}
-
-function match(html, re) {
-  const m = html.match(re)
-  return m ? m[1] : ''
-}
-
-function matchAll(html, re) {
-  return [...html.matchAll(re)]
-}
-
-/** Normalises LinkedIn's permalink down to a bare numeric job id. */
-function extractJobId(input) {
-  if (/^\d{6,}$/.test(input)) return input
-  const urn = input.match(/jobPosting:(\d+)/)
-  if (urn) return urn[1]
-  const view = input.match(/\/jobs\/view\/(?:[^/?#]*?-)?(\d{6,})(?:[/?#]|$)/)
-  if (view) return view[1]
-  const digits = input.match(/(\d{9,})/)
-  return digits ? digits[1] : ''
-}
-
-// ---------------------------------------------------------------------------
-// LinkedIn guest endpoints
-// ---------------------------------------------------------------------------
+/** Per-request ceiling so one slow source cannot stall an aggregate search. */
+const SOURCE_TIMEOUT_MS = 12000
 
 /**
- * Lists postings for a keyword/location pair.
- * @returns {Promise<Array<object>>}
+ * Fields kept in a summary payload. Descriptions are the expensive part of any
+ * job listing, so they are opt-in via `fields: "full"` rather than the default.
  */
-async function searchJobs({ keywords, location = '', page = 0, start, limit = 25 }) {
-  const offset = typeof start === 'number' ? start : page * 25
-  const params = new URLSearchParams({
-    keywords,
-    location,
-    trk: 'public_jobs_jobs-search-bar_search-submit',
-    position: '1',
-    pageNum: String(page),
-    start: String(offset)
-  })
+const SUMMARY_FIELDS = [
+  'source',
+  'id',
+  'title',
+  'company',
+  'location',
+  'url',
+  'postedAt',
+  'salary',
+  'sources'
+]
 
-  const html = await politeFetch(
-    `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?${params}`
-  )
-
-  if (!html.includes('jobPosting:')) {
-    log(`search returned no cards (bytes=${html.length})`)
-    return []
+/** Drops everything a summary reader does not need. */
+function project(job, fields) {
+  if (fields === 'full') return job
+  const out = {}
+  for (const key of SUMMARY_FIELDS) {
+    const value = job[key]
+    if (value !== undefined && value !== null && value !== '') out[key] = value
   }
-
-  // Each card owns exactly one entity-URN, so splitting on it yields one chunk per job.
-  const chunks = html.split(/(?=data-entity-urn="urn:li:jobPosting:)/).slice(1)
-
-  return chunks.slice(0, limit).map((chunk) => {
-    const id = match(chunk, /data-entity-urn="urn:li:jobPosting:(\d+)"/)
-    const url = match(chunk, /class="base-card__full-link[^"]*"\s+href="([^"]+)"/)
-
-    const job = {
-      id,
-      title: text(match(chunk, /<h3 class="base-search-card__title">([\s\S]*?)<\/h3>/)),
-      company: text(match(chunk, /<h4 class="base-search-card__subtitle">[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/)),
-      location: text(match(chunk, /<span class="job-search-card__location">([\s\S]*?)<\/span>/)),
-      postedAt: match(chunk, /<time[^>]*datetime="([^"]+)"/) || undefined,
-      url: decodeEntities(url) || (id ? `https://www.linkedin.com/jobs/view/${id}` : '')
-    }
-
-    const note = text(
-      match(chunk, /<span class="job-posting-benefits__text">([\s\S]*?)<\/span>/)
-    )
-    if (note) job.note = note
-
-    return job
-  })
-}
-
-/**
- * Fetches the full description + hiring criteria for one posting.
- *
- * Uses the public (logged-out) job page. The older
- * `/jobs-guest/jobs/api/view/{id}` endpoint now returns 404.
- */
-async function getJobDetails({ jobId }) {
-  const id = extractJobId(jobId)
-  if (!id) throw new Error(`Could not extract a job id from "${jobId}"`)
-
-  const html = await politeFetch(`https://www.linkedin.com/jobs/view/${id}`)
-
-  const job = {
-    id,
-    title: text(match(html, /<h1[^>]*class="[^"]*top-card-layout__title[^"]*"[^>]*>([\s\S]*?)<\/h1>/)),
-    company: text(match(html, /<a[^>]*class="[^"]*topcard__org-name-link[^"]*"[^>]*>([\s\S]*?)<\/a>/)),
-    location: text(match(html, /<span class="topcard__flavor topcard__flavor--bullet">([\s\S]*?)<\/span>/)),
-    description: text(
-      match(html, /<div class="show-more-less-html__markup[^"]*"[^>]*>([\s\S]*?)<\/div>/)
-    ),
-    criteria: [],
-    url: `https://www.linkedin.com/jobs/view/${id}`
-  }
-
-  // Criteria come as two parallel class lists (subheaders and values), so zip them.
-  const labels = [...html.matchAll(/<h3 class="description__job-criteria-subheader[^"]*"[^>]*>([\s\S]*?)<\/h3>/g)]
-    .map((m) => text(m[1]))
-  const values = [...html.matchAll(/<span class="description__job-criteria-text[^"]*"[^>]*>([\s\S]*?)<\/span>/g)]
-    .map((m) => text(m[1]))
-  for (let i = 0; i < Math.max(labels.length, values.length); i++) {
-    if (labels[i] || values[i]) job.criteria.push({ label: labels[i] ?? '', value: values[i] ?? '' })
-  }
-
-  const applicants = text(match(html, /<span class="[^"]*num-applicants__caption[^"]*"[^>]*>([\s\S]*?)<\/span>/))
-  if (applicants) job.applicants = applicants
-
-  const postedRelative = text(
-    match(html, /<span class="[^"]*posted-time-ago__text[^"]*"[^>]*>([\s\S]*?)<\/span>/)
-  )
-  if (postedRelative) job.postedRelative = postedRelative
-
-  const postedAt = match(html, /<time[^>]*datetime="([^"]+)"/)
-  if (postedAt) job.postedAt = postedAt
-
-  if (/Solicitud sencilla|Easy Apply/i.test(html)) job.easyApply = true
-
-  if (!job.title && !job.description) {
-    throw new Error(`Job ${id} is no longer posted, or it is private.`)
-  }
-
-  return job
+  return out
 }
 
 // ---------------------------------------------------------------------------
-// MCP tool definitions
+// Tool schemas
 // ---------------------------------------------------------------------------
+
+const PAGING = {
+  start: { type: 'number', description: 'Offset for pagination. Defaults to 0.' },
+  limit: { type: 'number', description: 'Max results, 1-50. Defaults to 25.' },
+  fields: {
+    type: 'string',
+    enum: ['summary', 'full'],
+    description: '"summary" (default) omits descriptions to save tokens. "full" includes them.'
+  }
+}
+
+const ATS = {
+  org: {
+    type: 'string',
+    description: 'Company slug on that ATS board, e.g. "airbnb" for Greenhouse, "notion" for Ashby.'
+  },
+  keywords: { type: 'string', description: 'Keywords matched against title, company and description.' },
+  location: { type: 'string', description: 'Substring matched against the job location. Optional.' },
+  limit: PAGING.limit,
+  fields: PAGING.fields
+}
+
+const KEYWORDS_ONLY = {
+  keywords: { type: 'string', description: 'Search keywords, e.g. "data engineer python".' },
+  location: { type: 'string', description: 'City or region, e.g. "Santiago, Chile". Optional.' },
+  start: PAGING.start,
+  limit: PAGING.limit,
+  fields: PAGING.fields
+}
+
+function searchToolSchema(source) {
+  if (source.needsOrg) {
+    return { type: 'object', properties: { ...ATS }, required: ['org'] }
+  }
+  const props = { ...KEYWORDS_ONLY }
+  // Boards without a keyword search still accept one as optional.
+  if (source.optionalKeywords) delete props.keywords
+  return {
+    type: 'object',
+    properties: props,
+    required: source.optionalKeywords ? [] : ['keywords']
+  }
+}
 
 const TOOLS = [
   {
-    name: 'search-jobs',
+    name: 'search-all',
     description:
-      'Search LinkedIn job postings via the public guest endpoints (no login, your account is never involved). ' +
-      'Returns id, title, company, location, posting date and URL. ' +
-      'Use `start` to paginate (each page returns up to 25 results). ' +
-      'For the full description of a posting, call `get-job-details` afterwards.',
+      'Searches several job boards at once and de-duplicates the results. Recommended first call. ' +
+      'Returns compact rows only (title/company/location/url) — use `get-job-details` for the full text. ' +
+      'Sources: ' +
+      searchableSources()
+        .map((s) => s.id)
+        .join(', ') +
+      '.',
     inputSchema: {
       type: 'object',
       properties: {
-        keywords: {
-          type: 'string',
-          description:
-            'Job keywords, e.g. "Data Analyst" or "junior data analyst" or "analista de datos junior"'
+        keywords: { type: 'string', description: 'Search keywords, e.g. "backend python".' },
+        location: { type: 'string', description: 'City or region, e.g. "Santiago, Chile". Optional.' },
+        sources: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Restrict to specific sources. Omit to search all of them.'
         },
-        location: {
-          type: 'string',
-          description:
-            'City or region, e.g. "Santiago, Chile". Optional; leave empty for any location.'
-        },
-        start: {
+        perSource: {
           type: 'number',
-          description: 'Pagination offset (0, 25, 50, ...). Defaults to 0.'
+          description: 'Max results kept per source. Defaults to 5 — keep it low, this is a summary.'
         },
-        limit: {
-          type: 'number',
-          description: 'Maximum results to return (1-50). Defaults to 25.'
-        }
+        maxResults: { type: 'number', description: 'Total cap after de-duplication. Defaults to 30.' }
       },
       required: ['keywords']
     }
   },
+  ...searchableSources().map((source) => ({
+    name: `search-${source.id}`,
+    description: `${source.name}: ${source.blurb}`,
+    inputSchema: searchToolSchema(source)
+  })),
   {
     name: 'get-job-details',
     description:
-      'Full description of a single job posting, including hiring criteria (seniority, employment type, ' +
-      'schedule, sectors), applicant count and whether it offers Easy Apply. ' +
-      'Accepts either the full job URL or the numeric id returned by `search-jobs`. ' +
-      'Use this to compare a posting against a CV or a set of requirements.',
+      'Fetches the full description of one posting. `source` plus `id` is enough; ' +
+      'Greenhouse and Lever also need `org`.',
     inputSchema: {
       type: 'object',
       properties: {
-        jobId: {
+        source: {
           type: 'string',
-          description:
-            'Job posting URL (https://www.linkedin.com/jobs/view/...) or numeric id.'
-        }
+          enum: SOURCES.map((s) => s.id),
+          description: 'Which board the job came from.'
+        },
+        id: { type: 'string', description: 'Job id as returned by the search tools.' },
+        org: { type: 'string', description: 'Required only for greenhouse and lever.' }
       },
-      required: ['jobId']
+      required: ['source', 'id']
     }
   }
 ]
 
 // ---------------------------------------------------------------------------
-// MCP stdio transport (newline-delimited JSON-RPC)
+// Handlers
 // ---------------------------------------------------------------------------
 
-const SERVER_INFO = { name: 'linkedin-jobs', version: '1.0.0' }
+function clamp(value, fallback, max) {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : fallback
+}
+
+async function runSearch(source, args) {
+  const started = Date.now()
+  try {
+    const result = await Promise.race([
+      source.search(args),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${source.id} timed out after ${SOURCE_TIMEOUT_MS}ms`)), SOURCE_TIMEOUT_MS)
+      )
+    ])
+    const jobs = (result?.jobs ?? []).map((job) => ({ ...job, source: source.id }))
+    return { source: source.id, ok: true, ms: Date.now() - started, count: result?.count, jobs }
+  } catch (error) {
+    return { source: source.id, ok: false, error: error.message, jobs: [] }
+  }
+}
+
+async function searchAll(args) {
+  const perSource = clamp(args.perSource, 5, 25)
+  const maxResults = clamp(args.maxResults, 30, 100)
+
+  const wanted = args.sources?.length
+    ? args.sources.map((id) => getSource(id))
+    : searchableSources()
+
+  // Sources that need a company slug cannot be searched blind.
+  const runnable = wanted.filter((s) => !s.needsOrg)
+  const skipped = wanted.filter((s) => s.needsOrg).map((s) => s.id)
+
+  const settled = await mapLimit(runnable, 4, (source) =>
+    runSearch(source, { ...args, start: 0, limit: perSource, fields: 'summary' })
+  )
+
+  // mapLimit reports { ok, value }. runSearch already produces a ready-made
+  // per-source report, so unwrap the successes and flatten the failures.
+  const reports = settled.map((r) =>
+    r.ok
+      ? r.value
+      : { source: r.source, ok: false, error: r.error?.message ?? String(r.error), jobs: [] }
+  )
+
+  const merged = dedupe(reports.flatMap((r) => r.jobs)).slice(0, maxResults)
+
+  return {
+    count: merged.length,
+    sources: reports.map((r) =>
+      r.ok
+        ? { source: r.source, ok: true, returned: r.jobs.length, total: r.count, ms: r.ms }
+        : { source: r.source, ok: false, error: r.error }
+    ),
+    ...(skipped.length
+      ? { skipped: `${skipped.join(', ')} need an "org" (company slug) — use their own tool.` }
+      : {}),
+    jobs: merged.map((job) => project(job, 'summary'))
+  }
+}
+
+async function callTool(name, args) {
+  if (name === 'search-all') {
+    if (!args?.keywords?.trim()) throw new Error('`keywords` is required.')
+    return searchAll(args)
+  }
+
+  if (name === 'get-job-details') {
+    const source = getSource(args.source)
+    if (!source.details) throw new Error(`Source "${source.id}" does not support details.`)
+    return source.details({ id: args.id, org: args.org })
+  }
+
+  if (name.startsWith('search-')) {
+    const source = getSource(name.slice('search-'.length))
+    const fields = args.fields ?? 'summary'
+    const result = await runSearch(source, { ...args, limit: clamp(args.limit, 25, 50), fields })
+    if (!result.ok) throw new Error(result.error)
+    return {
+      source: result.source,
+      count: result.count ?? result.jobs.length,
+      jobs: result.jobs.map((job) => project(job, fields))
+    }
+  }
+
+  throw new Error(`Unknown tool: ${name}`)
+}
+
+// ---------------------------------------------------------------------------
+// MCP stdio transport (newline-delimited JSON-RPC)
+// ---------------------------------------------------------------------------
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n')
@@ -278,27 +256,6 @@ function reply(id, result) {
 
 function replyError(id, code, message) {
   send({ jsonrpc: '2.0', id, error: { code, message } })
-}
-
-async function callTool(name, args) {
-  if (name === 'search-jobs') {
-    if (!args?.keywords?.trim()) throw new Error('`keywords` is required.')
-    const jobs = await searchJobs({
-      keywords: args.keywords.trim(),
-      location: (args.location ?? '').trim(),
-      start: typeof args.start === 'number' ? args.start : 0,
-      limit: Math.min(Math.max(args.limit ?? 25, 1), 50)
-    })
-    // Wrapped in an object: MCP `structuredContent` must be a record, not an array.
-    return { count: jobs.length, start: typeof args.start === 'number' ? args.start : 0, jobs }
-  }
-
-  if (name === 'get-job-details') {
-    if (!args?.jobId) throw new Error('`jobId` is required.')
-    return await getJobDetails({ jobId: String(args.jobId).trim() })
-  }
-
-  throw new Error(`Unknown tool: ${name}`)
 }
 
 async function handle(line) {
@@ -335,19 +292,19 @@ async function handle(line) {
   }
 
   if (method === 'tools/call') {
-    const name = params?.name
+    const toolName = params?.name
     try {
-      const result = await callTool(name, params?.arguments ?? {})
-      const isRecord =
-        typeof result === 'object' && result !== null && !Array.isArray(result)
+      const result = await callTool(toolName, params?.arguments ?? {})
+      const isRecord = typeof result === 'object' && result !== null && !Array.isArray(result)
+      // Aggregated lists are compact; a single job detail is worth reading formatted.
+      const pretty = toolName === 'get-job-details'
       reply(id, {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        // Optional, but when present MCP requires an object rather than an array.
+        content: [{ type: 'text', text: JSON.stringify(result, null, pretty ? 2 : 0) }],
         ...(isRecord ? { structuredContent: result } : {})
       })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      log(`tools/call ${name} failed: ${message}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      log(`tools/call ${toolName} failed: ${message}`)
       reply(id, {
         isError: true,
         content: [{ type: 'text', text: `Error: ${message}` }]
@@ -387,4 +344,4 @@ process.on('uncaughtException', (err) => {
   log(`uncaught: ${err?.stack ?? err}`)
 })
 
-log(`linkedin-jobs MCP ready (pid=${process.pid})`)
+log(`job-search MCP ready v${SERVER_INFO.version} (pid=${process.pid}) sources=${SOURCES.map((s) => s.id).join(',')}`)

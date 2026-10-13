@@ -1,7 +1,7 @@
 {
   "name": "linkedin-jobs-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for LinkedIn job search. No login, no API keys, no dependencies, one file.",
+  "version": "2.0.0",
+  "description": "MCP server for job search across LinkedIn, Computrabajo, Greenhouse, Lever, Ashby, RemoteOK and Remotive. No login, no API keys, no dependencies.",
   "type": "module",
   "main": "server.mjs",
   "bin": {
@@ -9,6 +9,8 @@
   },
   "files": [
     "server.mjs",
+    "core",
+    "sources",
     "README.md",
     "LICENSE"
   ],
@@ -26,8 +28,15 @@
     "claude",
     "opencode",
     "linkedin",
+    "computrabajo",
+    "greenhouse",
+    "lever",
+    "ashby",
+    "remotive",
+    "remoteok",
     "jobs",
     "job-search",
+    "remote-jobs",
     "recruiting",
     "api"
   ],
